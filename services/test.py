@@ -1,404 +1,444 @@
 """
-Testing Script
-Evaluates trained models on test dataset
+Test and evaluation module for model ensemble
 """
-
-import pandas as pd
+import os
+import json
 import numpy as np
-from pathlib import Path
-from typing import Dict, List, Tuple
+import pandas as pd
+from typing import Dict, List, Tuple, Any, Optional
+import logging
+import sys
+
+# Add services directory to path if needed
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
     recall_score,
     f1_score,
-    roc_auc_score,
     confusion_matrix,
     classification_report
 )
-import argparse
-import sys
 
-# Add project root to path
-sys.path.append(str(Path(__file__).parent.parent))
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # Use non-interactive backend
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    PLOTTING_AVAILABLE = True
+except ImportError:
+    PLOTTING_AVAILABLE = False
+    logging.warning("Matplotlib/Seaborn not available. Plotting will be disabled.")
 
-from inference import ModelInference
+from inference import ModelEnsemble
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-class ModelTester:
-    """
-    Test trained models on evaluation dataset.
-    """
+class ModelEvaluator:
+    """Evaluator for testing model performance"""
     
-    def __init__(self, inference_service: ModelInference):
+    def __init__(self, ensemble: ModelEnsemble):
         """
-        Initialize tester.
+        Initialize evaluator
         
         Args:
-            inference_service: Initialized ModelInference instance
+            ensemble: ModelEnsemble instance to evaluate
         """
-        self.inference = inference_service
+        self.ensemble = ensemble
     
-    def load_test_data(self, filepath: str) -> Tuple[List[str], List[int]]:
+    def load_test_data(self, data_path: str, text_col: str = 'text', 
+                      label_col: str = 'label') -> Tuple[List[str], List[int]]:
         """
-        Load test data from TSV file.
+        Load test data from various formats
+        
+        Supported formats:
+        - CSV files (.csv)
+        - Excel files (.xlsx, .xls)
+        - JSON files (.json)
+        - Text files (.txt) with format: label\ttext
         
         Args:
-            filepath: Path to TSV file
-        
+            data_path: Path to test data file
+            text_col: Name of text column (for structured formats)
+            label_col: Name of label column (for structured formats)
+            
         Returns:
             Tuple of (texts, labels)
         """
-        print(f"Loading test data from {filepath}...")
+        if not os.path.exists(data_path):
+            raise FileNotFoundError(f"Test data not found at {data_path}")
         
-        # Read TSV file
-        df = pd.read_csv(filepath, sep='\t', header=None, names=['label', 'text'])
+        logger.info(f"Loading test data from {data_path}")
         
-        # Clean data
-        df = df.dropna()
-        df = df[df['label'].isin([0, 1])]
+        # Determine file type and load accordingly
+        if data_path.endswith('.csv'):
+            df = pd.read_csv(data_path)
+            
+        elif data_path.endswith(('.xlsx', '.xls')):
+            df = pd.read_excel(data_path)
+            
+        elif data_path.endswith('.json'):
+            df = pd.read_json(data_path)
+            
+        elif data_path.endswith('.txt'):
+            # Assume format: label\ttext
+            texts, labels = [], []
+            with open(data_path, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    parts = line.split('\t')
+                    if len(parts) >= 2:
+                        try:
+                            labels.append(int(parts[0]))
+                            texts.append(parts[1])
+                        except ValueError:
+                            logger.warning(f"Line {line_num}: Could not parse label as integer")
+                    else:
+                        logger.warning(f"Line {line_num}: Invalid format (expected: label\\ttext)")
+            
+            logger.info(f"Loaded {len(texts)} samples from text file")
+            return texts, labels
+            
+        else:
+            raise ValueError(f"Unsupported file format: {data_path}")
         
-        texts = df['text'].astype(str).tolist()
-        labels = df['label'].astype(int).tolist()
+        # Extract texts and labels from DataFrame
+        if text_col not in df.columns:
+            raise ValueError(f"Text column '{text_col}' not found in data. Available columns: {df.columns.tolist()}")
         
-        print(f"✓ Loaded {len(texts)} samples")
-        print(f"  Real news (0): {labels.count(0)}")
-        print(f"  Fake news (1): {labels.count(1)}")
+        texts = df[text_col].astype(str).tolist()
         
+        if label_col not in df.columns:
+            logger.warning(f"Label column '{label_col}' not found. Using default labels (0)")
+            labels = [0] * len(df)
+        else:
+            labels = df[label_col].astype(int).tolist()
+        
+        logger.info(f"Loaded {len(texts)} samples from {data_path}")
         return texts, labels
     
-    def compute_metrics(
-        self,
-        y_true: np.ndarray,
-        y_pred: np.ndarray,
-        y_prob: np.ndarray
-    ) -> Dict[str, float]:
+    def evaluate(self, texts: List[str], true_labels: List[int], 
+                save_path: Optional[str] = None) -> Dict[str, Any]:
         """
-        Compute evaluation metrics.
+        Evaluate model ensemble on test data
         
         Args:
-            y_true: True labels
-            y_pred: Predicted labels
-            y_prob: Prediction probabilities (for positive class)
+            texts: List of input texts
+            true_labels: List of true labels
+            save_path: Optional directory path to save evaluation results
+            
+        Returns:
+            Dictionary containing evaluation metrics
+        """
+        if len(texts) != len(true_labels):
+            raise ValueError(f"Number of texts ({len(texts)}) must match number of labels ({len(true_labels)})")
         
+        logger.info(f"Evaluating on {len(texts)} samples...")
+        
+        # Get predictions
+        predictions = self.ensemble.predict_batch(texts, show_progress=True)
+        
+        # Extract predictions and probabilities
+        ensemble_preds = []
+        bert_preds = []
+        roberta_preds = []
+        tfidf_preds = []
+        confidences = []
+        
+        for pred in predictions:
+            ensemble_preds.append(pred.ensemble_pred)
+            confidences.append(pred.confidence)
+            
+            if pred.bert_pred is not None:
+                bert_preds.append(pred.bert_pred)
+            if pred.roberta_pred is not None:
+                roberta_preds.append(pred.roberta_pred)
+            if pred.tfidf_pred is not None:
+                tfidf_preds.append(pred.tfidf_pred)
+        
+        # Calculate metrics for ensemble
+        logger.info("Calculating metrics...")
+        ensemble_metrics = self._calculate_metrics(true_labels, ensemble_preds, "ensemble")
+        
+        # Calculate metrics for individual models
+        metrics = {'ensemble': ensemble_metrics}
+        
+        if bert_preds and len(bert_preds) == len(true_labels):
+            metrics['bert'] = self._calculate_metrics(true_labels, bert_preds, "bert")
+        
+        if roberta_preds and len(roberta_preds) == len(true_labels):
+            metrics['roberta'] = self._calculate_metrics(true_labels, roberta_preds, "roberta")
+        
+        if tfidf_preds and len(tfidf_preds) == len(true_labels):
+            metrics['tfidf'] = self._calculate_metrics(true_labels, tfidf_preds, "tfidf")
+        
+        # Add confidence statistics
+        metrics['confidence_stats'] = {
+            'mean': float(np.mean(confidences)),
+            'std': float(np.std(confidences)),
+            'min': float(np.min(confidences)),
+            'max': float(np.max(confidences)),
+            'median': float(np.median(confidences))
+        }
+        
+        # Add sample information
+        metrics['sample_info'] = {
+            'total_samples': len(texts),
+            'num_classes': len(set(true_labels)),
+            'class_distribution': {int(k): int(v) for k, v in 
+                                  pd.Series(true_labels).value_counts().to_dict().items()}
+        }
+        
+        # Save results if path provided
+        if save_path:
+            self._save_results(metrics, texts, true_labels, predictions, save_path)
+        
+        return metrics
+    
+    def _calculate_metrics(self, true_labels: List[int], pred_labels: List[int], 
+                          model_name: str) -> Dict[str, Any]:
+        """
+        Calculate evaluation metrics
+        
+        Args:
+            true_labels: True labels
+            pred_labels: Predicted labels
+            model_name: Name of the model
+            
         Returns:
             Dictionary of metrics
         """
         metrics = {
-            'accuracy': accuracy_score(y_true, y_pred),
-            'precision': precision_score(y_true, y_pred, zero_division=0),
-            'recall': recall_score(y_true, y_pred, zero_division=0),
-            'f1': f1_score(y_true, y_pred, zero_division=0),
+            'accuracy': float(accuracy_score(true_labels, pred_labels)),
+            'precision': float(precision_score(true_labels, pred_labels, 
+                                              average='weighted', zero_division=0)),
+            'recall': float(recall_score(true_labels, pred_labels, 
+                                        average='weighted', zero_division=0)),
+            'f1_score': float(f1_score(true_labels, pred_labels, 
+                                      average='weighted', zero_division=0)),
+            'confusion_matrix': confusion_matrix(true_labels, pred_labels).tolist()
         }
         
-        # Add AUC-ROC if possible
+        # Add classification report
         try:
-            metrics['auc_roc'] = roc_auc_score(y_true, y_prob)
-        except:
-            metrics['auc_roc'] = 0.0
+            report = classification_report(true_labels, pred_labels, output_dict=True, zero_division=0)
+            metrics['classification_report'] = report
+        except Exception as e:
+            logger.warning(f"Could not generate classification report: {str(e)}")
         
         return metrics
     
-    def print_results(
-        self,
-        model_name: str,
-        metrics: Dict[str, float],
-        y_true: np.ndarray,
-        y_pred: np.ndarray
-    ):
+    def _save_results(self, metrics: Dict[str, Any], texts: List[str], 
+                     true_labels: List[int], predictions: List[Any], 
+                     save_path: str):
         """
-        Print formatted results.
+        Save evaluation results to files
         
         Args:
-            model_name: Name of the model
-            metrics: Computed metrics
-            y_true: True labels
-            y_pred: Predicted labels
+            metrics: Metrics dictionary
+            texts: Input texts
+            true_labels: True labels
+            predictions: List of Prediction objects
+            save_path: Directory to save results
         """
-        print(f"\n{'='*70}")
-        print(f"{model_name.upper()} RESULTS")
-        print(f"{'='*70}")
-        print(f"Accuracy:  {metrics['accuracy']:.4f} ({metrics['accuracy']*100:.2f}%)")
-        print(f"Precision: {metrics['precision']:.4f} ({metrics['precision']*100:.2f}%)")
-        print(f"Recall:    {metrics['recall']:.4f} ({metrics['recall']*100:.2f}%)")
-        print(f"F1-Score:  {metrics['f1']:.4f} ({metrics['f1']*100:.2f}%)")
-        print(f"AUC-ROC:   {metrics['auc_roc']:.4f} ({metrics['auc_roc']*100:.2f}%)")
-        print(f"{'='*70}")
+        os.makedirs(save_path, exist_ok=True)
+        logger.info(f"Saving results to {save_path}")
         
-        # Confusion matrix
-        cm = confusion_matrix(y_true, y_pred)
-        print(f"\nConfusion Matrix:")
-        print(f"                Predicted")
-        print(f"              Real    Fake")
-        print(f"Actual Real   {cm[0,0]:<6}  {cm[0,1]:<6}")
-        print(f"       Fake   {cm[1,0]:<6}  {cm[1,1]:<6}")
+        # Save metrics as JSON
+        metrics_path = os.path.join(save_path, 'metrics.json')
+        with open(metrics_path, 'w') as f:
+            json.dump(metrics, f, indent=2)
+        logger.info(f"✓ Metrics saved to {metrics_path}")
         
-        # Per-class accuracy
-        print(f"\nPer-Class Accuracy:")
-        print(f"Real news: {cm[0,0]/cm[0].sum():.4f} ({cm[0,0]}/{cm[0].sum()})")
-        print(f"Fake news: {cm[1,1]/cm[1].sum():.4f} ({cm[1,1]}/{cm[1].sum()})")
-        print(f"{'='*70}\n")
-    
-    def test_model(
-        self,
-        texts: List[str],
-        labels: List[int],
-        model: str = 'bert',
-        ensemble_method: str = 'average',
-        batch_size: int = 32
-    ) -> Dict:
-        """
-        Test a specific model.
-        
-        Args:
-            texts: List of text samples
-            labels: List of true labels
-            model: Model to test ('bert', 'roberta', 'ensemble')
-            ensemble_method: Ensemble method if model='ensemble'
-            batch_size: Batch size for inference
-        
-        Returns:
-            Dictionary with results
-        """
-        print(f"\nTesting {model.upper()} model...")
-        
-        # Batch prediction
-        all_predictions = []
-        all_probabilities = []
-        
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i+batch_size]
+        # Save detailed predictions as CSV
+        pred_data = []
+        for text, true_label, pred in zip(texts, true_labels, predictions):
+            row = {
+                'text': text,
+                'true_label': true_label,
+                'ensemble_pred': pred.ensemble_pred,
+                'ensemble_confidence': pred.confidence,
+                'correct': true_label == pred.ensemble_pred
+            }
             
-            # Predict
-            results = self.inference.predict(
-                batch_texts,
-                model=model,
-                ensemble_method=ensemble_method
-            )
+            if pred.bert_pred is not None:
+                row['bert_pred'] = pred.bert_pred
+            if pred.roberta_pred is not None:
+                row['roberta_pred'] = pred.roberta_pred
+            if pred.tfidf_pred is not None:
+                row['tfidf_pred'] = pred.tfidf_pred
             
-            all_predictions.extend(results['predictions'])
-            all_probabilities.extend(results['probabilities'][:, 1])  # Prob of class 1
+            pred_data.append(row)
         
-        y_pred = np.array(all_predictions)
-        y_prob = np.array(all_probabilities)
-        y_true = np.array(labels)
+        results_df = pd.DataFrame(pred_data)
+        csv_path = os.path.join(save_path, 'detailed_predictions.csv')
+        results_df.to_csv(csv_path, index=False)
+        logger.info(f"✓ Detailed predictions saved to {csv_path}")
         
-        # Compute metrics
-        metrics = self.compute_metrics(y_true, y_pred, y_prob)
+        # Create and save confusion matrix plot
+        if PLOTTING_AVAILABLE:
+            try:
+                self._plot_confusion_matrix(metrics['ensemble']['confusion_matrix'], save_path)
+            except Exception as e:
+                logger.warning(f"Could not create confusion matrix plot: {str(e)}")
         
-        # Print results
-        model_display_name = f"{model} ({ensemble_method})" if model == 'ensemble' else model
-        self.print_results(model_display_name, metrics, y_true, y_pred)
-        
-        return {
-            'model': model,
-            'ensemble_method': ensemble_method if model == 'ensemble' else None,
-            'metrics': metrics,
-            'predictions': y_pred,
-            'probabilities': y_prob
-        }
+        # Save summary report
+        self._save_summary_report(metrics, save_path)
     
-    def test_all_models(
-        self,
-        texts: List[str],
-        labels: List[int],
-        ensemble_method: str = 'average',
-        batch_size: int = 32
-    ) -> Dict[str, Dict]:
-        """
-        Test all available models.
+    def _plot_confusion_matrix(self, cm: List[List[int]], save_path: str):
+        """Plot and save confusion matrix"""
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=True)
+        plt.title('Ensemble Model - Confusion Matrix', fontsize=14, fontweight='bold')
+        plt.ylabel('True Label', fontsize=12)
+        plt.xlabel('Predicted Label', fontsize=12)
+        plt.tight_layout()
         
-        Args:
-            texts: List of text samples
-            labels: List of true labels
-            ensemble_method: Ensemble method
-            batch_size: Batch size
-        
-        Returns:
-            Dictionary mapping model names to results
-        """
-        results = {}
-        available_models = self.inference.get_available_models()
-        
-        print(f"\n{'='*70}")
-        print(f"TESTING ALL MODELS")
-        print(f"Available models: {', '.join(available_models)}")
-        print(f"{'='*70}")
-        
-        # Test individual models
-        for model in ['bert', 'roberta']:
-            if model in available_models:
-                results[model] = self.test_model(
-                    texts, labels, model=model, batch_size=batch_size
-                )
-        
-        # Test ensemble if multiple models available
-        if 'ensemble' in available_models:
-            results[f'ensemble_{ensemble_method}'] = self.test_model(
-                texts, labels, model='ensemble',
-                ensemble_method=ensemble_method,
-                batch_size=batch_size
-            )
-        
-        return results
+        plot_path = os.path.join(save_path, 'confusion_matrix.png')
+        plt.savefig(plot_path, bbox_inches='tight', dpi=300)
+        plt.close()
+        logger.info(f"✓ Confusion matrix plot saved to {plot_path}")
     
-    def compare_models(self, results: Dict[str, Dict]):
-        """
-        Compare results from multiple models.
+    def _save_summary_report(self, metrics: Dict[str, Any], save_path: str):
+        """Save a human-readable summary report"""
+        report_path = os.path.join(save_path, 'evaluation_summary.txt')
         
-        Args:
-            results: Dictionary of results from test_all_models
-        """
-        if len(results) < 2:
-            return
+        with open(report_path, 'w') as f:
+            f.write("="*70 + "\n")
+            f.write("MODEL EVALUATION SUMMARY\n")
+            f.write("="*70 + "\n\n")
+            
+            # Sample information
+            f.write("Dataset Information:\n")
+            f.write("-"*70 + "\n")
+            sample_info = metrics.get('sample_info', {})
+            f.write(f"Total Samples: {sample_info.get('total_samples', 'N/A')}\n")
+            f.write(f"Number of Classes: {sample_info.get('num_classes', 'N/A')}\n")
+            
+            class_dist = sample_info.get('class_distribution', {})
+            if class_dist:
+                f.write("\nClass Distribution:\n")
+                for label, count in sorted(class_dist.items()):
+                    percentage = (count / sample_info['total_samples'] * 100)
+                    f.write(f"  Class {label}: {count} samples ({percentage:.1f}%)\n")
+            f.write("\n")
+            
+            # Model performance
+            f.write("Model Performance:\n")
+            f.write("-"*70 + "\n")
+            
+            for model_name in ['ensemble', 'bert', 'roberta', 'tfidf']:
+                if model_name in metrics and model_name != 'confidence_stats':
+                    model_metrics = metrics[model_name]
+                    f.write(f"\n{model_name.upper()}:\n")
+                    f.write(f"  Accuracy:  {model_metrics['accuracy']:.4f}\n")
+                    f.write(f"  Precision: {model_metrics['precision']:.4f}\n")
+                    f.write(f"  Recall:    {model_metrics['recall']:.4f}\n")
+                    f.write(f"  F1-Score:  {model_metrics['f1_score']:.4f}\n")
+            
+            # Confidence statistics
+            f.write("\n")
+            f.write("Confidence Statistics:\n")
+            f.write("-"*70 + "\n")
+            conf_stats = metrics.get('confidence_stats', {})
+            f.write(f"Mean:   {conf_stats.get('mean', 0):.4f}\n")
+            f.write(f"Std:    {conf_stats.get('std', 0):.4f}\n")
+            f.write(f"Min:    {conf_stats.get('min', 0):.4f}\n")
+            f.write(f"Max:    {conf_stats.get('max', 0):.4f}\n")
+            f.write(f"Median: {conf_stats.get('median', 0):.4f}\n")
+            
+            f.write("\n" + "="*70 + "\n")
         
-        print(f"\n{'='*70}")
-        print(f"MODEL COMPARISON")
-        print(f"{'='*70}")
-        
-        # Create comparison table
-        metrics = ['accuracy', 'precision', 'recall', 'f1', 'auc_roc']
-        
-        # Header
-        model_names = list(results.keys())
-        header = f"{'Metric':<15}"
-        for name in model_names:
-            header += f"{name:<15}"
-        print(header)
-        print("-" * (15 + 15 * len(model_names)))
-        
-        # Rows
-        for metric in metrics:
-            row = f"{metric:<15}"
-            for name in model_names:
-                value = results[name]['metrics'][metric]
-                row += f"{value:.4f}         "
-            print(row)
-        
-        print(f"{'='*70}")
-        
-        # Find best model for each metric
-        print(f"\nBest Models:")
-        for metric in metrics:
-            best_model = max(
-                results.keys(),
-                key=lambda m: results[m]['metrics'][metric]
-            )
-            best_score = results[best_model]['metrics'][metric]
-            print(f"  {metric:<15}: {best_model} ({best_score:.4f})")
-        
-        print(f"{'='*70}\n")
+        logger.info(f"✓ Summary report saved to {report_path}")
 
 
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Test trained models')
+def evaluate_models(test_data_path: str, models_base_path: str = "models", 
+                   text_col: str = 'text', label_col: str = 'label',
+                   save_results: bool = True, output_dir: str = "results") -> Dict[str, Any]:
+    """
+    Convenience function for evaluating models
     
-    parser.add_argument(
-        '--data',
-        type=str,
-        default='data/test_file.tsv',
-        help='Path to test data (TSV format)'
-    )
-    parser.add_argument(
-        '--bert-model',
-        type=str,
-        default='models/bert/bert/final_model',
-        help='Path to BERT model'
-    )
-    parser.add_argument(
-        '--roberta-model',
-        type=str,
-        default='models/robert/final_model',
-        help='Path to RoBERTa model'
-    )
-    parser.add_argument(
-        '--model',
-        type=str,
-        default='all',
-        choices=['bert', 'roberta', 'ensemble', 'all'],
-        help='Model to test'
-    )
-    parser.add_argument(
-        '--ensemble-method',
-        type=str,
-        default='average',
-        choices=['average', 'voting', 'weighted'],
-        help='Ensemble method'
-    )
-    parser.add_argument(
-        '--batch-size',
-        type=int,
-        default=32,
-        help='Batch size for inference'
-    )
-    parser.add_argument(
-        '--device',
-        type=str,
-        default='cuda',
-        choices=['cuda', 'cpu'],
-        help='Device for inference'
-    )
+    Args:
+        test_data_path: Path to test data file
+        models_base_path: Path to models directory
+        text_col: Name of text column
+        label_col: Name of label column
+        save_results: Whether to save results
+        output_dir: Directory to save results
+        
+    Returns:
+        Dictionary of evaluation metrics
+    """
+    # Load ensemble
+    logger.info("Initializing model ensemble...")
+    ensemble = ModelEnsemble(models_base_path)
+    ensemble.print_info()
     
-    return parser.parse_args()
-
-
-def main():
-    """Main testing function."""
-    args = parse_args()
-    
-    print(f"\n{'='*70}")
-    print("MODEL TESTING")
-    print(f"{'='*70}\n")
-    
-    # Check paths
-    bert_path = Path(args.bert_model)
-    roberta_path = Path(args.roberta_model)
-    data_path = Path(args.data)
-    
-    if not data_path.exists():
-        print(f"Error: Test data not found at {args.data}")
-        return
-    
-    # Initialize inference service
-    print("Initializing inference service...")
-    inference = ModelInference(
-        bert_model_path=str(bert_path) if bert_path.exists() else None,
-        roberta_model_path=str(roberta_path) if roberta_path.exists() else None,
-        device=args.device
-    )
-    
-    available = inference.get_available_models()
-    if not available:
-        print("Error: No models could be loaded")
-        return
-    
-    print(f"✓ Available models: {', '.join(available)}\n")
-    
-    # Initialize tester
-    tester = ModelTester(inference)
+    # Initialize evaluator
+    evaluator = ModelEvaluator(ensemble)
     
     # Load test data
-    texts, labels = tester.load_test_data(args.data)
+    texts, labels = evaluator.load_test_data(test_data_path, text_col, label_col)
     
-    # Test models
-    if args.model == 'all':
-        results = tester.test_all_models(
-            texts, labels,
-            ensemble_method=args.ensemble_method,
-            batch_size=args.batch_size
-        )
-        tester.compare_models(results)
-    else:
-        result = tester.test_model(
-            texts, labels,
-            model=args.model,
-            ensemble_method=args.ensemble_method,
-            batch_size=args.batch_size
-        )
+    # Evaluate
+    save_path = os.path.join(output_dir, 'evaluation') if save_results else None
+    metrics = evaluator.evaluate(texts, labels, save_path)
     
-    print("\n✓ Testing completed!\n")
+    # Print summary to console
+    print_evaluation_summary(metrics)
+    
+    return metrics
 
 
-if __name__ == "__main__":
-    main()
+def print_evaluation_summary(metrics: Dict[str, Any]):
+    """Print evaluation summary to console"""
+    print("\n" + "="*70)
+    print("MODEL EVALUATION RESULTS")
+    print("="*70)
+    
+    # Print model performance
+    for model_name in ['ensemble', 'bert', 'roberta', 'tfidf']:
+        if model_name in metrics and isinstance(metrics[model_name], dict):
+            model_metrics = metrics[model_name]
+            print(f"\n{model_name.upper()}:")
+            print(f"  Accuracy:  {model_metrics.get('accuracy', 0):.4f}")
+            print(f"  Precision: {model_metrics.get('precision', 0):.4f}")
+            print(f"  Recall:    {model_metrics.get('recall', 0):.4f}")
+            print(f"  F1-Score:  {model_metrics.get('f1_score', 0):.4f}")
+    
+    # Print confidence statistics
+    if 'confidence_stats' in metrics:
+        print(f"\nConfidence Statistics:")
+        conf = metrics['confidence_stats']
+        print(f"  Mean:   {conf.get('mean', 0):.4f}")
+        print(f"  Std:    {conf.get('std', 0):.4f}")
+        print(f"  Min:    {conf.get('min', 0):.4f}")
+        print(f"  Max:    {conf.get('max', 0):.4f}")
+        print(f"  Median: {conf.get('median', 0):.4f}")
+    
+    print("="*70 + "\n")
+
+
+def load_test_data(data_path: str, text_col: str = 'text', 
+                  label_col: str = 'label') -> Tuple[List[str], List[int]]:
+    """
+    Convenience function for loading test data
+    
+    Args:
+        data_path: Path to test data file
+        text_col: Name of text column
+        label_col: Name of label column
+        
+    Returns:
+        Tuple of (texts, labels)
+    """
+    # Create a temporary ensemble just for loading data
+    ensemble = ModelEnsemble()
+    evaluator = ModelEvaluator(ensemble)
+    return evaluator.load_test_data(data_path, text_col, label_col)
