@@ -1,6 +1,6 @@
 # Multi-Model Ensemble Evaluation System
 
-A comprehensive evaluation framework for assessing ensemble performance of BERT, RoBERTa, and TF-IDF models trained using the Self-Paced Supervised Teacher (SPST) methodology.
+A comprehensive evaluation framework for assessing ensemble performance of BERT, RoBERTa, and TF-IDF models trained using the Segmented Parameter Sequential Training (SPST) methodology.
 
 ## Overview
 
